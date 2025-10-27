@@ -444,7 +444,7 @@ void readSeedIndexFromEEPROM() {
         // This was a soft reset (External Reset via reset button, or Watchdog Reset)
         // and EEPROM was valid. Retain the previously stored seed index.
         currentSeedIndex = storedIndex;
-    }
+    },
     // Always update the EEPROM with the 'currentSeedIndex' for the next boot cycle.
     EEPROM.update(EEPROM_SEED_INDEX_ADDR, currentSeedIndex);
 }

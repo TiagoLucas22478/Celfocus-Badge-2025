@@ -35,6 +35,8 @@ volatile bool necDataReady = false;
 #define IR_SEND_PORT PORTB
 #define IR_SEND_DDR  DDRB
 #define IR_SEND_BIT  (1 << PB2)
+#define IR_RECEIVE_PORT_PIN PINB
+#define IR_RECEIVE_BIT (1 << PB3)
 
 // --- LED Helper Functions ---
 void setHuman() {
@@ -46,7 +48,6 @@ void setHuman() {
 void setZombie() {
   uint32_t green = strip.Color(0, 255, 0);
   uint32_t red = strip.Color(255, 0, 0);
-
   strip.fill(green);
 
   // Set the eyes to red
@@ -65,9 +66,9 @@ void goToSleep() {
   allLedsOff();
   delay(10);
   ADCSRA &= ~(1 << ADEN); // Disable ADC
-  power_timer0_disable();  // Disable Timer0 (used by millis()/micros())
-  power_timer1_disable();  // Disable Timer1
-  power_usi_disable();     // Disable USI (I2C, SPI)
+  power_timer0_disable();  // Disable Timer0 (used by millis()/micros())
+  power_timer1_disable();  // Disable Timer1
+  power_usi_disable();     // Disable USI (I2C, SPI)
   set_sleep_mode(SLEEP_MODE_PWR_DOWN); // Set sleep mode to max power saving
   cli(); // Disable interrupts
   sleep_enable();
@@ -125,100 +126,93 @@ void sendNEC(uint32_t data) {
 
 
 // --- Manual IR Receiver Functions ---
-
-/**
- * @brief Pin Change Interrupt Service Routine.
- * This fires on EVERY pin change for PB0-PB5 (if enabled).
- */
-ISR(PCINT0_vect) {
-  static unsigned long lastInterruptTime = 0;
-
-  // Check if the change was on our IR pin (optional but good practice)
-  if (!(PINB & (1 << IR_RECEIVE_PIN))) {
-    // Pin is LOW (start of a mark)
-  } else {
-    // Pin is HIGH (start of a space)
-  }
-
-  unsigned long now = micros();
-  unsigned int pulseDuration = now - lastInterruptTime;
-  lastInterruptTime = now;
-
-  // Ignore glitches (anything under 100us)
-  if (pulseDuration < 100) {
-    return;
-  }
-
-  // Check for a long gap (timeout) which signifies a new code
-  if (pulseDuration > 12000) {
-    necPulseIndex = 0; // Reset
-  }
-
-  // Store the pulse duration
-  if (necPulseIndex < NEC_PULSE_COUNT) {
-    necPulses[necPulseIndex] = pulseDuration;
-    necPulseIndex++;
-  }
-
-  // If we have collected all 67 pulses, set the flag for the main loop
-  if (necPulseIndex == NEC_PULSE_COUNT) {
-    necDataReady = true;
-    // Main loop will reset necPulseIndex after processing
-  }
-}
-
-/**
- * @brief Checks if an actual timing is within tolerance of an expected timing.
- * @param actual The measured duration in microseconds.
- * @param expected The NEC protocol's expected duration in microseconds.
- * @return True if within ~25% tolerance, false otherwise.
- */
 bool checkTiming(unsigned int actual, unsigned int expected) {
   // Allow a 25% tolerance window
   return (actual > (expected * 0.75)) && (actual < (expected * 1.25));
 }
 
-/**
- * @brief Decodes the raw pulse data stored in necPulses[].
- * @return The 32-bit decoded NEC code (LSB first), or 0 if decoding fails.
- */
-uint32_t decodeNEC() {
-  // Step 1: Check the 9ms LOW (Mark) + 4.5ms HIGH (Space) start condition
-  // necPulses[0] is the 9ms mark, necPulses[1] is the 4.5ms space
-  if (!checkTiming(necPulses[0], 9000) || !checkTiming(necPulses[1], 4500)) {
-    return 0; // Invalid start pulse
+uint32_t receiveNEC() {
+  unsigned long startTime, markDuration, spaceDuration;
+  unsigned long timeoutStart;
+
+  // Wait for the pin to go LOW (start of 9ms pulse)
+  // The TSOP38238 output is active LOW.
+  // We'll wait up to 100ms for a signal to start.
+  timeoutStart = micros();
+  while (IR_RECEIVE_PORT_PIN & IR_RECEIVE_BIT) {
+    // Pin is HIGH (idle)
+    if (micros() - timeoutStart > 100000) {
+      return 0; // 100ms timeout
+    }
   }
 
-  uint32_t data = 0;
-  uint8_t pulseIdx = 2; // Start checking data from the 3rd pulse (index 2)
+  // --- Start Pulse Detected ---
 
-  // Step 2: Loop through all 32 bits
-  for (int i = 0; i < 32; i++) {
-    // All bits start with a 562.5us Mark (LOW pulse)
-    if (!checkTiming(necPulses[pulseIdx], 562)) {
-      return 0; // Error: bit mark is wrong duration
+  // 1. Measure the 9ms Mark (LOW)
+  startTime = micros();
+  while (!(IR_RECEIVE_PORT_PIN & IR_RECEIVE_BIT)) {
+    // Pin is LOW
+    if (micros() - startTime > 10000) {
+      return 0; // 10ms timeout (pulse too long)
     }
-    pulseIdx++;
+  }
+  markDuration = micros() - startTime;
 
-    // Now check the following Space (HIGH pulse) to determine 0 or 1
-    if (checkTiming(necPulses[pulseIdx], 1687)) {
+  // 2. Measure the 4.5ms Space (HIGH)
+  startTime = micros();
+  while (IR_RECEIVE_PORT_PIN & IR_RECEIVE_BIT) {
+    // Pin is HIGH
+    if (micros() - startTime > 5000) {
+      return 0; // 5ms timeout (space too long)
+    }
+  }
+  spaceDuration = micros() - startTime;
+
+  // 3. Check if it's a valid NEC Start Condition
+  if (!checkTiming(markDuration, 9000) || !checkTiming(spaceDuration, 4500)) {
+    return 0; // Not a valid start
+  }
+
+  // --- Data Bits ---
+  uint32_t data = 0;
+  for (int i = 0; i < 32; i++) {
+    // 1. Measure the 562us Bit Mark (LOW)
+    startTime = micros();
+    while (!(IR_RECEIVE_PORT_PIN & IR_RECEIVE_BIT)) {
+      // Pin is LOW
+      if (micros() - startTime > 700) {
+        return 0; // 700us timeout
+      }
+    }
+    markDuration = micros() - startTime;
+
+    // 2. Measure the Bit Space (HIGH)
+    startTime = micros();
+    while (IR_RECEIVE_PORT_PIN & IR_RECEIVE_BIT) {
+      // Pin is HIGH
+      if (micros() - startTime > 2000) {
+        return 0; // 2ms timeout
+      }
+    }
+    spaceDuration = micros() - startTime;
+
+    // 3. Check Mark and determine bit value from Space
+    if (!checkTiming(markDuration, 562)) {
+      return 0; // Invalid bit mark
+    }
+
+    if (checkTiming(spaceDuration, 1687)) {
       // It's a '1' (long space)
       data |= (1UL << i); // Set the bit (LSB first)
-    } else if (checkTiming(necPulses[pulseIdx], 562)) {
+    } else if (checkTiming(spaceDuration, 562)) {
       // It's a '0' (short space)
       // We do nothing, the bit in 'data' is already 0
     } else {
-      // Error: space is not a valid '0' or '1'
-      return 0;
+      return 0; // Invalid space duration
     }
-    pulseIdx++;
   }
 
-  // Step 3: Check the final stop bit (a 562.5us Mark)
-  if (!checkTiming(necPulses[pulseIdx], 562)) {
-     // This check is optional but good for validation
-  }
-
+  // If we got here, all 32 bits were received successfully
   return data;
 }
 
@@ -249,50 +243,18 @@ void setup() {
 
   } else {
     setHuman();
-
-    // 2. Initialize IR Receiver Pin and Interrupts
-    pinMode(IR_RECEIVE_PIN, INPUT_PULLUP); // Enable internal pull-up
-    GIMSK |= (1 << PCIE);                  // Enable Pin Change Interrupts
-    PCMSK |= (1 << IR_RECEIVE_PIN);        // Enable PCINT for our pin (PB3)
-    sei();                                 // Enable global interrupts
-    goToSleep();
+    pinMode(IR_RECEIVE_PIN, INPUT_PULLUP);
   }
 }
 
 void loop() {
-  if (!isTriggered && necDataReady) {
-    cli();
-    
-    // Copy volatile data to local variables
-    unsigned int localPulses[NEC_PULSE_COUNT];
-    memcpy(localPulses, (const void*)necPulses, sizeof(necPulses));
-    
-    // Reset receiver state
-    necDataReady = false;
-    necPulseIndex = 0;
-    
-    // Re-enable interrupts
-    sei();
-
-    // Decode the copied data
-    uint32_t decodedData = decodeNEC();
-
-    // Check if the decoded code matches our trigger code
+  if(!isTriggered) {
+  uint32_t decodedData = receiveNEC();
     if (decodedData == TRIGGER_CODE) {
-
-      // --- !!! DEVICE TRIGGERED !!! ---
-
-      // 1. Set the triggered color pattern
+      // --- !!! INFECTED !!! ---
       setZombie();
-
-      // 2. Save the triggered state to EEPROM permanently
       EEPROM.write(EEPROM_ADDR, TRIGGERED_VALUE);
-
-      // 3. Update our state variable
       isTriggered = true;
-
-      // 4. Stop listening for IR (disable Pin Change Interrupt)
-      GIMSK &= ~(1 << PCIE);
     }
   }
 }

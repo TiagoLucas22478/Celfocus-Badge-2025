@@ -1,20 +1,8 @@
-/*
-  ATtiny85 Custom Circuit Firmware
-  
-  Controls a 16-LED NeoPixel strip, an IR receiver, and an IR transmitter.
-  
-  Hardware Connections (Arduino Pin Numbers):
-  - PIN 4 (PB4, Physical Pin 3): NeoPixel Data In
-  - PIN 3 (PB3, Physical Pin 2): IR Receiver (TSOP38238) Data Out
-  - PIN 2 (PB2, Physical Pin 7): IR LED Anode (via a current-limiting resistor)
-*/
-
-// --- Include Libraries ---
 #include <Adafruit_NeoPixel.h>
-#include <IRremote.hpp> // Use the modern IRremote library (v4.0.0 or newer)
 #include <EEPROM.h>
-#include <avr/sleep.h> // For power-saving mode
-#include <avr/power.h> // For peripheral power-down
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <avr/interrupt.h>
 
 // --- Constants ---
 #define NEOPIXEL_PIN   4  // ATtiny85 Arduino Pin 4 (PB4)
@@ -24,146 +12,278 @@
 #define NUM_LEDS 16 // Number of LEDs in the strip
 
 // The NEC code to trigger on and send.
-// 41103371 (decimal) is 0x271C0F43. We define it as an Unsigned Long.
+// 41103371 (decimal) is 0x271C0F43.
+// We receive and send this as an LSB-first 32-bit value.
 #define TRIGGER_CODE 41103371UL
 
 // --- EEPROM ---
-#define EEPROM_ADDR       0     // Address to store the trigger state
-#define TRIGGERED_VALUE   0x42  // A "magic number" to signify "triggered"
-
-// --- Global Objects ---
-// Parameter 1 = Number of pixels in strip
-// Parameter 2 = Arduino pin number (most are valid)
-// Parameter 3 = Pixel type flags, add together as needed:
-//   NEO_GRB     Pixels are wired for GRB bitstream (most NeoPixels)
-//   NEO_KHZ800  800 KHz bitstream (most modern NeoPixels)
+#define EEPROM_ADDR       0
+#define TRIGGERED_VALUE   0x42 // The meaning of life, the universe and all things
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
-
-// --- Global State ---
 bool isTriggered = false;
 
-// --- Helper Functions ---
+// --- Manual IR Receiver Globals ---
+// We need to capture 1 start pulse (LOW) + 1 start space (HIGH)
+// + 32 bits * (1 mark (LOW) + 1 space (HIGH)) + 1 stop pulse (LOW)
+// Total = 1 + 1 + 64 + 1 = 67 pulse/space timings
+#define NEC_PULSE_COUNT 67
+volatile unsigned int necPulses[NEC_PULSE_COUNT];
+volatile uint8_t necPulseIndex = 0;
+volatile bool necDataReady = false;
 
-/**
- * @brief Sets all LEDs to a pastel pink color.
- */
-void setPastelPink() {
-  // A pastel pink (R=255, G=182, B=193) dimmed for a "pastel" look
+// --- Manual IR Sender Defines ---
+#define IR_SEND_PORT PORTB
+#define IR_SEND_DDR  DDRB
+#define IR_SEND_BIT  (1 << PB2)
+
+// --- LED Helper Functions ---
+void setHuman() {
   uint32_t pastelPink = strip.Color(200, 140, 150);
   strip.fill(pastelPink);
   strip.show();
 }
 
-/**
- * @brief Sets the "triggered" color pattern: all green, 6th and 11th red.
- */
-void setTriggeredColors() {
+void setZombie() {
   uint32_t green = strip.Color(0, 255, 0);
   uint32_t red = strip.Color(255, 0, 0);
 
   strip.fill(green);
-  
-  // Set 6th LED (index 5) and 11th LED (index 10) to red
-  strip.setPixelColor(5, red); 
+
+  // Set the eyes to red
+  strip.setPixelColor(5, red);
   strip.setPixelColor(10, red);
-  
+
   strip.show();
 }
 
-/**
- * @brief Turns all LEDs off.
- */
 void allLedsOff() {
   strip.fill(strip.Color(0, 0, 0));
   strip.show();
 }
 
-/**
- * @brief Puts the ATtiny85 into deep sleep mode (power-down).
- * This function will not return. The chip must be power-cycled to restart.
- */
 void goToSleep() {
   allLedsOff();
-  delay(10); // Allow strip to update
-
-  // Disable all peripherals for maximum power saving
+  delay(10);
   ADCSRA &= ~(1 << ADEN); // Disable ADC
-  power_timer0_disable();  // Disable Timer0 (used by millis() and IR send)
-  power_timer1_disable();  // Disable Timer1 (used by IR receive)
+  power_timer0_disable();  // Disable Timer0 (used by millis()/micros())
+  power_timer1_disable();  // Disable Timer1
   power_usi_disable();     // Disable USI (I2C, SPI)
-
   set_sleep_mode(SLEEP_MODE_PWR_DOWN); // Set sleep mode to max power saving
   cli(); // Disable interrupts
   sleep_enable();
   sleep_cpu(); // Go to sleep and never wake up
 }
 
+// --- Manual IR Sender Functions ---
+
+/**
+ * @brief Sends a 38kHz IR carrier wave (a "mark") for a duration.
+ * @param us Duration in microseconds to send the mark.
+ */
+void sendMark(uint16_t us) {
+  unsigned long start = micros();
+  while (micros() - start < us) {
+    IR_SEND_PORT |= IR_SEND_BIT;  // Set pin HIGH
+    delayMicroseconds(10);        // Approx. half-period (13us) for 38kHz @ 8MHz
+    IR_SEND_PORT &= ~IR_SEND_BIT; // Set pin LOW
+    delayMicroseconds(10);        // Approx. half-period (13us) for 38kHz @ 8MHz
+  }
+}
+
+/**
+ * @brief Sends no signal (a "space") for a duration.
+ * @param us Duration in microseconds for the space.
+ */
+void sendSpace(uint16_t us) {
+  IR_SEND_PORT &= ~IR_SEND_BIT; // Ensure pin is LOW
+  delayMicroseconds(us);
+}
+
+/**
+ * @brief Sends a 32-bit NEC code (LSB first).
+ * @param data The 32-bit code to send.
+ */
+void sendNEC(uint32_t data) {
+  // 1. Send NEC Start Pulse
+  sendMark(9000); // 9ms Mark
+  sendSpace(4500); // 4.5ms Space
+
+  // 2. Send 32 bits of data, LSB first
+  for (int i = 0; i < 32; i++) {
+    sendMark(562); // 562.5us Mark
+    if (data & (1UL << i)) {
+      sendSpace(1687); // '1' bit (1.6875ms Space)
+    } else {
+      sendSpace(562);  // '0' bit (562.5us Space)
+    }
+  }
+
+  // 3. Send Stop Bit
+  sendMark(562); // 562.5us Mark
+  sendSpace(100);  // Small gap
+}
+
+
+// --- Manual IR Receiver Functions ---
+
+/**
+ * @brief Pin Change Interrupt Service Routine.
+ * This fires on EVERY pin change for PB0-PB5 (if enabled).
+ */
+ISR(PCINT0_vect) {
+  static unsigned long lastInterruptTime = 0;
+
+  // Check if the change was on our IR pin (optional but good practice)
+  if (!(PINB & (1 << IR_RECEIVE_PIN))) {
+    // Pin is LOW (start of a mark)
+  } else {
+    // Pin is HIGH (start of a space)
+  }
+
+  unsigned long now = micros();
+  unsigned int pulseDuration = now - lastInterruptTime;
+  lastInterruptTime = now;
+
+  // Ignore glitches (anything under 100us)
+  if (pulseDuration < 100) {
+    return;
+  }
+
+  // Check for a long gap (timeout) which signifies a new code
+  if (pulseDuration > 12000) {
+    necPulseIndex = 0; // Reset
+  }
+
+  // Store the pulse duration
+  if (necPulseIndex < NEC_PULSE_COUNT) {
+    necPulses[necPulseIndex] = pulseDuration;
+    necPulseIndex++;
+  }
+
+  // If we have collected all 67 pulses, set the flag for the main loop
+  if (necPulseIndex == NEC_PULSE_COUNT) {
+    necDataReady = true;
+    // Main loop will reset necPulseIndex after processing
+  }
+}
+
+/**
+ * @brief Checks if an actual timing is within tolerance of an expected timing.
+ * @param actual The measured duration in microseconds.
+ * @param expected The NEC protocol's expected duration in microseconds.
+ * @return True if within ~25% tolerance, false otherwise.
+ */
+bool checkTiming(unsigned int actual, unsigned int expected) {
+  // Allow a 25% tolerance window
+  return (actual > (expected * 0.75)) && (actual < (expected * 1.25));
+}
+
+/**
+ * @brief Decodes the raw pulse data stored in necPulses[].
+ * @return The 32-bit decoded NEC code (LSB first), or 0 if decoding fails.
+ */
+uint32_t decodeNEC() {
+  // Step 1: Check the 9ms LOW (Mark) + 4.5ms HIGH (Space) start condition
+  // necPulses[0] is the 9ms mark, necPulses[1] is the 4.5ms space
+  if (!checkTiming(necPulses[0], 9000) || !checkTiming(necPulses[1], 4500)) {
+    return 0; // Invalid start pulse
+  }
+
+  uint32_t data = 0;
+  uint8_t pulseIdx = 2; // Start checking data from the 3rd pulse (index 2)
+
+  // Step 2: Loop through all 32 bits
+  for (int i = 0; i < 32; i++) {
+    // All bits start with a 562.5us Mark (LOW pulse)
+    if (!checkTiming(necPulses[pulseIdx], 562)) {
+      return 0; // Error: bit mark is wrong duration
+    }
+    pulseIdx++;
+
+    // Now check the following Space (HIGH pulse) to determine 0 or 1
+    if (checkTiming(necPulses[pulseIdx], 1687)) {
+      // It's a '1' (long space)
+      data |= (1UL << i); // Set the bit (LSB first)
+    } else if (checkTiming(necPulses[pulseIdx], 562)) {
+      // It's a '0' (short space)
+      // We do nothing, the bit in 'data' is already 0
+    } else {
+      // Error: space is not a valid '0' or '1'
+      return 0;
+    }
+    pulseIdx++;
+  }
+
+  // Step 3: Check the final stop bit (a 562.5us Mark)
+  if (!checkTiming(necPulses[pulseIdx], 562)) {
+     // This check is optional but good for validation
+  }
+
+  return data;
+}
+
 // --- Main Program ---
 
 void setup() {
-  // Initialize NeoPixel strip
   strip.begin();
-  strip.show(); // Initialize all pixels to 'off'
-
-  // Check EEPROM to see if we've been triggered before
+  strip.show();
   if (EEPROM.read(EEPROM_ADDR) == TRIGGERED_VALUE) {
     isTriggered = true;
   } else {
     isTriggered = false;
   }
 
-  // --- Handle startup logic based on state ---
   if (isTriggered) {
-    // === TRIGGERED STARTUP ===
-    // This runs if the chip was already triggered and is restarting.
-    
-    // 1. Initialize IR Sender
-    IrSender.begin(IR_SEND_PIN); // No feedback LED
+    setZombie();
+    // 1. Initialize IR Sender Pin
+    IR_SEND_DDR |= IR_SEND_BIT; // Set IR_SEND_PIN (PB2) to OUTPUT
+    IR_SEND_PORT &= ~IR_SEND_BIT; // Start LOW
 
     // 2. Send the IR code repeatedly for 10 seconds
     unsigned long startTime = millis();
     while (millis() - startTime < 10000) {
-      // Send the raw 32-bit NEC code. 0 repeats.
-      IrSender.sendNECRaw(TRIGGER_CODE, 0);
+      sendNEC(TRIGGER_CODE);
       delay(110); // Standard NEC repeat gap is ~108ms
     }
-
-    // 3. Go to deep sleep
-    goToSleep(); // This function does not return
+    goToSleep();
 
   } else {
-    // === NORMAL STARTUP ===
-    // This runs on first boot or if never triggered.
-    
-    // 1. Set initial colors
-    setPastelPink();
+    setHuman();
 
-    // 2. Initialize IR Receiver
-    IrReceiver.begin(IR_RECEIVE_PIN); // Starts listening
+    // 2. Initialize IR Receiver Pin and Interrupts
+    pinMode(IR_RECEIVE_PIN, INPUT_PULLUP); // Enable internal pull-up
+    GIMSK |= (1 << PCIE);                  // Enable Pin Change Interrupts
+    PCMSK |= (1 << IR_RECEIVE_PIN);        // Enable PCINT for our pin (PB3)
+    sei();                                 // Enable global interrupts
+    goToSleep();
   }
 }
 
 void loop() {
-  if (isTriggered) {
-    // If we were triggered *during this session*, we just stop.
-    // The next reboot will handle the IR transmit and sleep.
-    // This loop will just show the triggered colors.
-    while (true) {
-      // Do nothing
-    }
-  }
-
-  // --- Main Listening Loop (only runs if not triggered) ---
-  if (IrReceiver.decode()) {
+  if (!isTriggered && necDataReady) {
+    cli();
     
-    // Check if the received code is NEC protocol AND matches our trigger code
-    if (IrReceiver.decodedIRData.protocol == NEC &&
-        IrReceiver.decodedIRData.decodedRawData == TRIGGER_CODE) {
+    // Copy volatile data to local variables
+    unsigned int localPulses[NEC_PULSE_COUNT];
+    memcpy(localPulses, (const void*)necPulses, sizeof(necPulses));
+    
+    // Reset receiver state
+    necDataReady = false;
+    necPulseIndex = 0;
+    
+    // Re-enable interrupts
+    sei();
+
+    // Decode the copied data
+    uint32_t decodedData = decodeNEC();
+
+    // Check if the decoded code matches our trigger code
+    if (decodedData == TRIGGER_CODE) {
 
       // --- !!! DEVICE TRIGGERED !!! ---
 
       // 1. Set the triggered color pattern
-      setTriggeredColors();
+      setZombie();
 
       // 2. Save the triggered state to EEPROM permanently
       EEPROM.write(EEPROM_ADDR, TRIGGERED_VALUE);
@@ -171,11 +291,8 @@ void loop() {
       // 3. Update our state variable
       isTriggered = true;
 
-      // 4. Stop the IR receiver (saves power and stops listening)
-      IrReceiver.disableIRIn();
+      // 4. Stop listening for IR (disable Pin Change Interrupt)
+      GIMSK &= ~(1 << PCIE);
     }
-    
-    // Resume listening for the next code
-    IrReceiver.resume();
   }
 }
